@@ -755,4 +755,6 @@ p_cal_demo / p_cal_metab / p_cal_combined +
 brier_all %>% write_csv("multivar_rf_brier_scores.csv")
 ```
 
-
+```{r session-info}
+sessionInfo()
+```
