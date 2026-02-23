@@ -1,0 +1,758 @@
+---
+title: "Targeted ASD Stool Metabolomics Analysis"
+author: "Kevin Liu"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document: 
+    toc: true
+    keep_tex: true
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 999)
+
+library(tidyverse)
+library(egg)
+library(rstatix)
+library(tidymodels)
+library(yardstick)
+library(ranger)
+library(pROC)
+library(patchwork)
+library(scales)
+library(ggcorrplot)
+
+theme_set(theme_article() +
+          theme(aspect.ratio = 1))
+```
+
+```{r read_data, message=FALSE}
+clin_data = read_csv("data/clin_data.csv")
+
+avg_data = read_csv("data/data_averaged.csv") %>% 
+  left_join(clin_data, by = "subject_id") %>% 
+  relocate(subject_id, group, sex, age) %>% 
+  mutate(group = factor(group, levels = c("HC", "ASD")),
+         sex = factor(sex, levels = c("Female", "Male")))
+
+norm_data = read_csv("data/data_normalized.csv") %>% 
+  left_join(clin_data, by = "subject_id") %>% 
+  relocate(subject_id, group, sex, age) %>% 
+  mutate(group = factor(group, levels = c("HC", "ASD")),
+         sex = factor(sex, levels = c("Female", "Male")))
+
+qc_pass_subject_ids = read_csv("data/preparation/me_qc_pass.csv") %>% pull(subject_id) %>% unique()
+
+name_map = read_csv("data/name_map.csv")
+```
+
+```{r descriptive_stats}
+avg_data %>% 
+  mutate(group = ifelse(group == "HC", "NAC", "ASD")) %>%
+  ggplot(aes(x = age, fill = group)) +
+  geom_histogram(data = subset(avg_data %>% mutate(group = ifelse(group == "HC", "NAC", "ASD")), group == "NAC"),
+                 aes(y = after_stat(count)), binwidth = 1, boundary = 0, closed = "left") +
+  geom_histogram(data = subset(avg_data, group == "ASD"),
+                 aes(y = -after_stat(count)), binwidth = 1, boundary = 0, closed = "left") +
+  scale_y_continuous(labels = abs, limits = c(-10, 10)) +
+  scale_fill_manual(values = c("NAC" = "#21918c", "ASD" = "#fde725")) +
+  labs(x = "Age (years)", y = "Number of Subjects", fill = "Group") +
+  theme(legend.position = "bottom") +
+  geom_hline(yintercept = 0, linewidth = 0.25) +
+  coord_flip()
+
+table(avg_data$group, avg_data$sex)
+
+mol_summary = avg_data %>%
+  pivot_longer(cols = c(age, starts_with("mol_")), names_to = "metabolite") %>%
+  group_by(group, metabolite) %>%
+  summarise(mean = mean(value, na.rm = TRUE), 
+            sd = sd(value, na.rm = TRUE),
+            median = median(value, na.rm = TRUE),
+            min = min(value, na.rm = TRUE),
+            max = max(value, na.rm = TRUE)) %>% 
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)),
+         mean_sd = paste0(mean, " (", sd, ")"),
+         min_max = paste0("[", min, ", ", max, "]")) %>% 
+  select(group, metabolite, mean_sd, median, min_max)
+
+mol_summary
+
+mol_summary %>% write_csv("mol_summary.csv")
+```
+
+```{r get_zero_mol_summary}
+num_cols = avg_data %>%
+  select(where(is.numeric), -subject_id) %>%
+  names()
+
+avg_data %>%
+  select(group, all_of(num_cols)) %>%
+  pivot_longer(
+    cols      = -group,
+    names_to  = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(group, variable) %>%
+  summarise(
+    n         = n(),
+    n_zero    = sum(value == 0, na.rm = TRUE),
+    pct_zero  = n_zero / n * 100,
+    n_nonzero = sum(value != 0 & !is.na(value)),
+    # stats excluding zeros
+    mean   = mean(if_else(value == 0, NA_real_, value), na.rm = TRUE),
+    sd     = sd(if_else(value == 0, NA_real_, value), na.rm = TRUE),
+    min    = min(if_else(value == 0, NA_real_, value), na.rm = TRUE),
+    max    = max(if_else(value == 0, NA_real_, value), na.rm = TRUE),
+    median = median(if_else(value == 0, NA_real_, value), na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  ungroup() %>% 
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(range = str_c("[", min, ", ", max, "]"),
+         mean_sd = str_c(mean, " (", sd, ")"),
+         zeros = str_c(n_zero, "/", n_nonzero, " (", pct_zero, "%)")) %>% 
+  select(group, variable, mean_sd, range, median, zeros) %>% 
+  write_csv("mol_summary_zeros.csv")
+```
+
+
+```{r viz_data, fig.dpi=300, fig.width=8}
+avg_data %>%
+  pivot_longer(cols = starts_with("mol_"), names_to = "molecule") %>%
+  left_join(name_map %>% select(mol_name, compound_acronym), by = c("molecule" = "mol_name")) %>% 
+  mutate(molecule = compound_acronym,
+         group = ifelse(group == "HC", "NAC", "ASD")) %>% 
+  select(-compound_acronym) %>% 
+  ggplot(aes(x = group, y = value, fill = group)) +
+  geom_violin() +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  facet_wrap(~ molecule, scales = "free_y", ncol = 6) +
+  labs(x = "", y = "Concentration (nM)", 
+       fill = "Group") +
+  theme(legend.position = "bottom", aspect.ratio = 1,
+        strip.text = element_text(size = 6)) +
+  scale_fill_manual(values = c("#fde725", "#21918c"))
+
+norm_data %>%
+  pivot_longer(cols = starts_with("mol_"), names_to = "molecule") %>%
+  left_join(name_map %>% select(mol_name, compound_acronym), by = c("molecule" = "mol_name")) %>% 
+  mutate(molecule = compound_acronym,
+         group = ifelse(group == "HC", "NAC", "ASD")) %>% 
+  select(-compound_acronym) %>% 
+  ggplot(aes(x = group, y = value, fill = group)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  facet_wrap(~ molecule, scales = "free_y", ncol = 6) +
+  labs(x = "", y = "Normalized Log10(Concentration, nM)", 
+       fill = "Group") +
+  theme(legend.position = "bottom", aspect.ratio = 1,
+        strip.text = element_text(size = 6)) +
+  scale_fill_manual(values = c("#fde725", "#21918c"))
+```
+
+```{r corr_matrix, fig.width=10}
+num_vars = c("age", grep("^mol_", names(avg_data), value = TRUE))
+
+name_lookup = setNames(c(name_map$compound_acronym, "Age"),
+                       c(name_map$mol_name,           "age"))
+
+axis_levels = num_vars
+
+corr_lower_by_group = function(df_group, group_label) {
+  mat = df_group %>%
+    select(all_of(num_vars)) %>%
+    as.matrix()
+
+  rc = Hmisc::rcorr(mat, type = "spearman")
+  R  = rc$r
+  P  = rc$P
+
+  vars = colnames(R)
+  idx  = which(lower.tri(R), arr.ind = TRUE)
+
+  tibble(
+    Group = group_label,
+    Var1  = vars[idx[,1]],
+    Var2  = vars[idx[,2]],
+    r     = as.numeric(R[idx]),
+    p     = as.numeric(P[idx])
+  )
+}
+
+cor_df = bind_rows(
+  corr_lower_by_group(filter(avg_data, group == "ASD"), "ASD"),
+  corr_lower_by_group(filter(avg_data, group == "HC"),  "HC")
+) %>%
+  group_by(Group) %>%
+  mutate(
+    p_adj = p.adjust(p, method = "fdr"),     # FDR within each group
+    p_cap = pmax(p_adj, 1e-300),             # avoid -Inf for -log10
+    Var1  = factor(Var1, levels = axis_levels),
+    Var2  = factor(Var2, levels = axis_levels),
+    Significant = !is.na(p_adj) & p_adj < 0.05
+  ) %>%
+  ungroup() %>%
+  mutate(
+    Var1_label = recode(Var1, !!!name_lookup),
+    Var2_label = recode(Var2, !!!name_lookup)
+  )
+
+cor_df %>% 
+  mutate(Group = ifelse(Group == "HC", "NAC", "ASD")) %>%
+  ggplot(aes(x = Var1_label, y = Var2_label)) +
+  geom_point(aes(fill = r, size = -log10(p_cap)),
+             shape = 21, color = "grey60", stroke = 0.1, na.rm = TRUE) +
+  geom_point(data = filter(cor_df %>% mutate(Group = ifelse(Group == "HC", "NAC", "ASD")), Significant),
+             aes(size = -log10(p_cap)),
+             shape = 21, fill = NA, color = "black", stroke = 0.5, na.rm = TRUE) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, limits = c(-1, 1),
+                       oob = scales::squish, name = "Spearman r") +
+  scale_size(range = c(1.5, 6), name = NULL, guide = "none") +
+  coord_fixed() +
+  facet_wrap(~ Group, ncol = 2) +
+  theme_light() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.position = "right"
+  ) +
+  labs(x = NULL, y = NULL)
+
+cor_df %>% 
+  filter(p_adj < 0.05) %>% 
+  select(Group, Var1_label, Var2_label, r, p, p_adj) %>% 
+  write_csv("groupwise_sigif_corr.csv")
+```
+
+```{r univar_tests}
+norm_data %>%
+  # filter(subject_id %in% qc_pass_subject_ids) %>% 
+  pivot_longer(cols = starts_with("mol_"), names_to = "metabolite") %>%
+  group_by(metabolite) %>%
+  wilcox_test(value ~ group) %>%
+  adjust_pvalue(method = "fdr") %>% 
+  arrange(p) %>% 
+  left_join(name_map %>% select(mol_name, compound_name), by = c("metabolite" = "mol_name"))
+```
+
+```{r adj_univar_tests}
+adj_univar_lm = norm_data %>%
+  # filter(subject_id %in% qc_pass_subject_ids) %>% 
+  pivot_longer(cols = starts_with("mol_"), names_to = "molecule", values_to = "value") %>%
+  group_by(molecule) %>%
+  do(tidy(lm(value ~ group + age + sex, data = .))) %>%
+  ungroup() %>%
+  filter(term == "groupASD") %>%
+  mutate(p_adj = p.adjust(p.value, method = "fdr")) %>%
+  arrange(p.value) %>%
+  select(molecule, estimate, std.error, statistic, p.value, p_adj) %>% 
+  left_join(name_map %>% select(mol_name, compound_name), by = c("molecule" = "mol_name"))
+adj_univar_lm %>% 
+  write_csv("univar_adj_lm_results.csv")
+
+adj_univar_lm
+```
+
+```{r effect_sizes}
+cohen_d_manual = function(x, g) {
+  g1 = x[g == levels(g)[1]]
+  g2 = x[g == levels(g)[2]]
+  (mean(g1, na.rm = TRUE) - mean(g2, na.rm = TRUE)) /
+    sqrt((sd(g1, na.rm = TRUE)^2 + sd(g2, na.rm = TRUE)^2) / 2)
+}
+
+effect_sizes = avg_data %>%
+  # filter(subject_id %in% qc_pass_subject_ids) %>% 
+  pivot_longer(cols = starts_with("mol_"), names_to = "molecule", values_to = "value") %>%
+  group_by(molecule) %>%
+  summarise(
+    cohen_d = cohen_d_manual(value, group),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(abs(cohen_d)))
+
+effect_sizes
+```
+
+```{r log2fc, fig.dpi=300}
+# log2fc_result = avg_data %>%
+#   pivot_longer(cols = starts_with("mol_"), names_to = "molecule", values_to = "value") %>%
+#   group_by(group, molecule) %>%
+#   summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+#   pivot_wider(names_from = group, values_from = mean_value) %>%
+#   mutate(
+#     fold_change = ASD / HC,
+#     log2_fc = log2(fold_change)
+#   ) %>%
+#   arrange(desc(log2_fc)) %>% 
+#   left_join(name_map %>% select(mol_name, compound_acronym), by = c("molecule" = "mol_name")) %>% 
+#   mutate(molecule = compound_acronym) %>% 
+#   select(-compound_acronym)
+
+log2fc_result = norm_data %>%
+  pivot_longer(cols = starts_with("mol_"), names_to = "molecule", values_to = "value") %>%
+  group_by(group, molecule) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = mean_value) %>%
+  mutate(
+    log2_fc = (ASD - HC) * log2(10)  # Convert log10 difference to log2 scale
+  ) %>%
+  arrange(desc(log2_fc)) %>% 
+  left_join(name_map %>% select(mol_name, compound_acronym), by = c("molecule" = "mol_name")) %>% 
+  mutate(molecule = compound_acronym) %>% 
+  select(-compound_acronym)
+
+log2fc_result %>%
+  mutate(molecule = fct_rev(fct_inorder(molecule))) %>%
+  ggplot(aes(x = molecule, y = log2_fc, fill = log2_fc > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#fde725", "FALSE" = "#21918c"),
+                    labels = c("NAC > ASD", "ASD > NAC")) +
+  labs(
+    title = "Log2 Fold Change (ASD vs. NAC)",
+    x = NULL,
+    y = "Log2 Fold Change",
+    fill = "Direction"
+  ) +
+  ylim(-2.25, 2.25) +
+  theme(legend.position = "bottom") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray") +
+  geom_hline(yintercept = -1, linetype = "dashed", color = "gray")
+
+log2fc_result %>% 
+  write_csv("log2fc_results.csv")
+```
+
+```{r univar_rf}
+rf_base_data = avg_data %>%
+  mutate(group = factor(group, levels = c("HC", "ASD")))  # ASD is the positive class
+
+set.seed(123)
+folds = vfold_cv(rf_base_data, v = 5, strata = group)
+
+mol_names = names(rf_base_data)[str_starts(names(rf_base_data), "mol_")]
+
+get_cv_rf_auc = function(mol) {
+  df = rf_base_data %>% select(group, !!sym(mol))
+  
+  rec = recipe(group ~ ., data = df) %>%
+    step_zv(all_predictors())  # Remove zero-variance predictors (just in case)
+
+  rf_spec = rand_forest(trees = 500) %>%
+    set_mode("classification") %>%
+    set_engine("ranger", importance = "none")
+
+  wf = workflow() %>%
+    add_recipe(rec) %>%
+    add_model(rf_spec)
+
+  res = fit_resamples(
+    wf,
+    resamples = folds,
+    metrics = metric_set(roc_auc),
+    control = control_resamples(save_pred = TRUE, verbose = FALSE)
+  )
+
+  auc_val = collect_metrics(res) %>%
+    filter(.metric == "roc_auc") %>%
+    pull(mean)
+
+  tibble(molecule = mol, auc = auc_val)
+}
+
+rf_auc_all = map_dfr(mol_names, get_cv_rf_auc) %>%
+  arrange(desc(auc))
+
+print(rf_auc_all)
+
+rf_auc_all %>%
+  mutate(molecule = fct_reorder(molecule, auc)) %>%
+  ggplot(aes(x = molecule, y = auc)) +
+  geom_col(fill = "#21918c") +
+  coord_flip() +
+  labs(
+    title = "Random Forest Classification Performance by Molecule",
+    y = "Cross-Validated AUC",
+    x = NULL
+  ) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray")
+
+ind_auc_results = map_dfr(mol_names, function(mol) {
+  df = avg_data %>% select(group, !!sym(mol))
+
+  rec = recipe(group ~ ., data = df) %>%
+    step_zv(all_predictors())
+
+  wf = workflow() %>%
+    add_recipe(rec) %>%
+    add_model(rand_forest(trees = 500) %>%
+                set_mode("classification") %>%
+                set_engine("ranger"))
+
+  res = fit_resamples(
+    wf, resamples = folds,
+    metrics = metric_set(roc_auc),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+  preds = collect_predictions(res)
+  roc_obj = roc(response = preds$group, predictor = preds$.pred_ASD,
+                 levels = c("HC", "ASD"), direction = "<", ci = TRUE, boot.n = 2000)
+
+  tibble(
+    metabolite = mol,
+    auc = as.numeric(auc(roc_obj)),
+    ci_low = as.numeric(ci.auc(roc_obj)[1]),
+    ci_high = as.numeric(ci.auc(roc_obj)[3])
+  )
+}) %>%
+  arrange(desc(auc)) %>%
+  mutate(
+    auc_ci = sprintf("%.3f [%.3f-%.3f]", auc, ci_low, ci_high)
+  ) %>%
+  select(metabolite, auc_ci) %>% 
+  left_join(name_map %>% select(mol_name, compound_name), by = c("metabolite" = "mol_name")) %>% 
+  mutate(metabolite = compound_name) %>% 
+  select(-compound_name)
+
+ind_auc_results %>% write_csv("univar_rf_auc_results.csv")
+```
+
+```{r univar_roc}
+top_molecule = rf_auc_all %>%
+  slice_max(auc, n = 3) %>%
+  pull(molecule)
+
+rf_top_data = avg_data %>%
+  mutate(group = factor(group, levels = c("HC", "ASD"))) %>%
+  select(group, all_of(top_molecule))
+
+rec = recipe(group ~ ., data = rf_top_data) %>%
+  step_zv(all_predictors())
+
+rf_spec = rand_forest(trees = 500) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+wf = workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rf_spec)
+
+set.seed(123)
+folds = vfold_cv(rf_top_data, v = 5, strata = group)
+
+res = fit_resamples(
+  wf,
+  resamples = folds,
+  metrics = metric_set(roc_auc),
+  control = control_resamples(save_pred = TRUE)
+)
+
+preds = collect_predictions(res)
+
+roc_obj = roc(
+  response = preds$group,
+  predictor = preds$.pred_ASD,
+  levels = c("HC", "ASD"),
+  direction = "<",
+  ci = TRUE,
+  ci.alpha = 0.95,
+  boot.n = 2000,
+  stratified = FALSE
+)
+
+roc_df = tibble(
+  specificity = rev(roc_obj$specificities),
+  sensitivity = rev(roc_obj$sensitivities)
+)
+
+auc_val = auc(roc_obj)
+ci_vals = ci.auc(roc_obj)
+
+ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "#21918c", size = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  annotate(
+    "text",
+    x = 0.25,
+    y = 0.25,
+    label = sprintf("AUC = %.3f [%.3f–%.3f]", auc_val, ci_vals[1], ci_vals[3]),
+    hjust = 0,
+    size = 5
+  ) +
+  labs(
+    title = paste0("ROC Curve with 95% CI for ", paste0(top_molecule, collapse = ", ")),
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  )
+```
+
+```{r multivar_rf_all, fig.dpi=300, fig.height=10}
+set.seed(123)
+
+folds = vfold_cv(avg_data, v = 5, strata = group)
+
+top_mols = rf_auc_all %>%
+  slice_max(auc, n = 3) %>%
+  pull(molecule)
+
+model_definitions = tribble(
+  ~model_name, ~formula, ~panel_group, ~color,
+  "Age", group ~ age, "Demographics", "#21908CFF",
+  "Sex", group ~ sex, "Demographics", "#440154FF",
+  "Age + Sex", group ~ age + sex, "Demographics", "#FDE725FF",
+  "BH4", group ~ mol_bh4, "Metabolites", "#35B779FF",
+  "KYN", group ~ mol_kyn, "Metabolites", "#31688EFF",
+  "GABA", group ~ mol_gaba, "Metabolites", "#440154FF",
+  "BH4 + KYN + GABA", reformulate(top_mols, response = "group"), "Metabolites", "#26828EFF",
+  "Age + BH4 + KYN + GABA", reformulate(c("age", top_mols), response = "group"), "Combined", "#5DC863FF",
+  "Sex + BH4 + KYN + GABA", reformulate(c("sex", top_mols), response = "group"), "Combined", "#3B528BFF",
+  "Age + Sex + BH4 + KYN + GABA", reformulate(c("age", "sex", top_mols), response = "group"), "Combined", "#481567FF"
+)
+
+get_rf_roc = function(formula, model_label) {
+  rec = recipe(formula, data = avg_data) %>%
+    step_zv(all_predictors()) %>%
+    step_dummy(all_nominal_predictors())
+
+  wf = workflow() %>%
+    add_model(rand_forest(trees = 500, mode = "classification") %>%
+                set_engine("ranger")) %>%
+    add_recipe(rec)
+
+  res = fit_resamples(
+    wf, resamples = folds,
+    metrics = metric_set(roc_auc),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+  preds = collect_predictions(res)
+
+  roc_obj = roc(
+    response = preds$group,
+    predictor = preds$.pred_ASD,
+    levels = c("HC", "ASD"),
+    direction = "<",
+    ci = TRUE, boot.n = 2000
+  )
+
+  tibble(
+    model_name = model_label,
+    specificity = rev(roc_obj$specificities),
+    sensitivity = rev(roc_obj$sensitivities),
+    auc = as.numeric(auc(roc_obj)),
+    ci_low = as.numeric(ci.auc(roc_obj)[1]),
+    ci_high = as.numeric(ci.auc(roc_obj)[3])
+  )
+}
+
+roc_results = model_definitions %>%
+  mutate(roc = map2(formula, model_name, get_rf_roc)) %>%
+  unnest(roc, names_sep = "_") %>%
+  rename(
+    specificity = roc_specificity,
+    sensitivity = roc_sensitivity,
+    auc = roc_auc,
+    ci_low = roc_ci_low,
+    ci_high = roc_ci_high
+  )
+
+roc_labeled = roc_results %>%
+  group_by(model_name) %>%
+  mutate(
+    label = sprintf("%s\nAUC = %.3f [%.3f-%.3f]", model_name, first(auc), first(ci_low), first(ci_high))
+  ) %>%
+  ungroup()
+
+label_order = roc_labeled %>%
+  distinct(model_name, label) %>%
+  arrange(factor(model_name, levels = model_definitions$model_name)) %>%
+  pull(label)
+
+roc_labeled = roc_labeled %>%
+  mutate(label = factor(label, levels = label_order))
+
+plot_roc_group = function(data, panel) {
+  df = filter(data, panel_group == panel)
+
+  ggplot(df, aes(x = 1 - specificity, y = sensitivity, color = label)) +
+    geom_line(size = 1) +
+    geom_abline(linetype = "dashed", color = "gray") +
+    scale_color_manual(values = setNames(df$color, df$label)) +
+    labs(
+      x = "1-Specificity",
+      y = "Sensitivity",
+      color = NULL
+    ) +
+    coord_equal()
+}
+
+p_demo = plot_roc_group(roc_labeled, "Demographics")
+p_metab = plot_roc_group(roc_labeled, "Metabolites")
+p_combined = plot_roc_group(roc_labeled, "Combined")
+
+p_demo / p_metab / p_combined +
+  plot_annotation(tag_levels = "A", tag_prefix = "(", tag_suffix = ")")
+```
+
+```{r multivar_rf_metrics}
+set.seed(123)
+folds = vfold_cv(avg_data, v = 5, strata = group)
+
+compute_model_metrics = function(formula, label) {
+  rec = recipe(formula, data = avg_data) %>%
+    step_zv(all_predictors()) %>%
+    step_dummy(all_nominal_predictors())
+
+  rf_spec = rand_forest(trees = 500) %>%
+    set_mode("classification") %>%
+    set_engine("ranger")
+
+  wf = workflow() %>%
+    add_model(rf_spec) %>%
+    add_recipe(rec)
+
+  res = fit_resamples(
+    wf,
+    resamples = folds,
+    metrics = metric_set(roc_auc, accuracy, sens, spec, precision, recall, f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+  preds = collect_predictions(res)
+
+  roc_obj = roc(
+    response = preds$group,
+    predictor = preds$.pred_ASD,
+    levels = c("HC", "ASD"),
+    direction = "<",
+    ci = TRUE,
+    boot.n = 2000
+  )
+
+  auc_val = as.numeric(auc(roc_obj))
+  ci_vals = as.numeric(ci.auc(roc_obj))
+
+  metric_vals = collect_metrics(res) %>%
+    filter(.metric != "roc_auc") %>%
+    select(.metric, mean) %>%
+    pivot_wider(names_from = .metric, values_from = mean)
+
+  tibble(
+    model = label,
+    auc = auc_val,
+    auc_ci_low = ci_vals[1],
+    auc_ci_high = ci_vals[3]
+  ) %>%
+    bind_cols(metric_vals)
+}
+
+formulas = list(
+  "Age" = group ~ age,
+  "Sex" = group ~ sex,
+  "Age + Sex" = group ~ age + sex,
+  "BH4" = group ~ mol_bh4,
+  "KYN" = group ~ mol_kyn,
+  "GABA" = group ~ mol_gaba,
+  "BH4 + KYN + GABA" = reformulate(top_mols, response = "group"),
+  "Sex + BH4 + KYN + GABA" = reformulate(c("sex", top_mols), response = "group"),
+  "Age + BH4 + KYN + GABA" = reformulate(c("age", top_mols), response = "group"),
+  "Age + Sex + BH4 + KYN + GABA" = reformulate(c("age", "sex", top_mols), response = "group")
+)
+
+metrics_all = imap_dfr(formulas, compute_model_metrics) %>% 
+   mutate(across(where(is.numeric), ~ round(.x, 3)),
+          auc = paste0(auc, " [", auc_ci_low, "-", auc_ci_high, "]")) %>% 
+  select(-auc_ci_low, -auc_ci_high)
+
+metrics_all
+
+metrics_all %>% write_csv("multivar_rf_metrics.csv")
+```
+
+```{r multivar_rf_calibration, fig.dpi=300, fig.height=10}
+get_calibration_metrics = function(formula, model_label) {
+  rec = recipe(formula, data = avg_data) %>%
+    step_zv(all_predictors()) %>%
+    step_dummy(all_nominal_predictors())
+
+  wf = workflow() %>%
+    add_model(rand_forest(trees = 500, mode = "classification") %>% set_engine("ranger")) %>%
+    add_recipe(rec)
+
+  res = fit_resamples(
+    wf, resamples = folds,
+    control = control_resamples(save_pred = TRUE)
+  )
+
+  preds = collect_predictions(res) %>%
+    mutate(group = factor(group, levels = c("HC", "ASD")))  # ASD = positive class
+
+  brier = mean((if_else(preds$group == "ASD", 1, 0) - preds$.pred_ASD)^2)
+
+  cal_curve_raw = preds %>%
+    transmute(
+      pred = .pred_ASD,
+      obs = as.integer(group == "ASD"),
+      model_name = model_label
+    )
+
+  list(
+    brier = tibble(model_name = model_label, brier_score = brier),
+    curve_raw = cal_curve_raw
+  )
+}
+
+set.seed(123)
+cal_results = model_definitions %>%
+  mutate(cal = map2(formula, model_name, get_calibration_metrics))
+
+brier_all = map_dfr(cal_results$cal, "brier")
+
+curve_all_raw = map_dfr(cal_results$cal, "curve_raw")
+
+curve_all_annotated = curve_all_raw %>%
+  left_join(model_definitions %>% select(model_name, panel_group, color), by = "model_name") %>%
+  left_join(brier_all, by = "model_name") %>%
+  mutate(
+    label = sprintf("%s\nBrier = %.3f", model_name, brier_score)
+  )
+
+label_order_brier = model_definitions %>%
+  left_join(brier_all, by = "model_name") %>%
+  mutate(label = sprintf("%s\nBrier = %.3f", model_name, brier_score)) %>%
+  pull(label)
+
+curve_all_annotated = curve_all_annotated %>%
+  mutate(label = factor(label, levels = label_order_brier))
+
+plot_calibration_panel = function(data, panel_name) {
+  df = filter(data, panel_group == panel_name)
+
+  ggplot(df, aes(x = pred, y = obs, color = label)) +
+    geom_smooth(method = "loess", formula = y ~ x, se = FALSE, span = 1, size = 1) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+    scale_color_manual(values = setNames(df$color, df$label)) +
+    labs(
+      x = "Predicted Probability (ASD)",
+      y = "Observed Proportion (ASD)",
+      color = NULL
+    ) +
+    coord_fixed(xlim = c(0, 1), ylim = c(0, 1))
+}
+
+p_cal_demo = plot_calibration_panel(curve_all_annotated, "Demographics")
+p_cal_metab = plot_calibration_panel(curve_all_annotated, "Metabolites")
+p_cal_combined = plot_calibration_panel(curve_all_annotated, "Combined")
+
+p_cal_demo / p_cal_metab / p_cal_combined +
+  plot_annotation(tag_levels = "A", tag_prefix = "(", tag_suffix = ")")
+
+brier_all %>% write_csv("multivar_rf_brier_scores.csv")
+```
+
+
