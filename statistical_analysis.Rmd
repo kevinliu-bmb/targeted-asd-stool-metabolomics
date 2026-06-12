@@ -22,6 +22,7 @@ library(pROC)
 library(patchwork)
 library(scales)
 library(broom)
+library(ggpubr)
 
 theme_set(theme_article() +
           theme(aspect.ratio = 1))
@@ -231,6 +232,141 @@ cor_df %>%
     p_adj = formatC(p_adj, format = "e", digits = 2)
   ) %>% 
   write_csv("output_data/s5_groupwise_sigif_corr.csv")
+```
+
+```{r corr_scatterplots_all_significant_patchwork, fig.dpi=300, fig.width=10, fig.height=12}
+# Supplementary Figure 2
+# Scatterplots for all FDR-significant within-group correlations
+
+cor_df_labeled = cor_df %>%
+  select(-any_of(c("Var1_label", "Var2_label"))) %>%
+  left_join(
+    name_map %>% select(mol_name, compound_acronym),
+    by = c("Var1" = "mol_name")
+  ) %>%
+  rename(Var1_label = compound_acronym) %>%
+  left_join(
+    name_map %>% select(mol_name, compound_acronym),
+    by = c("Var2" = "mol_name")
+  ) %>%
+  rename(Var2_label = compound_acronym) %>%
+  mutate(
+    Var1 = as.character(Var1),
+    Var2 = as.character(Var2),
+    Var1_label = if_else(Var1 == "age", "Age", Var1_label),
+    Var2_label = if_else(Var2 == "age", "Age", Var2_label)
+  )
+
+panel_order = tribble(
+  ~Group, ~Var1,         ~Var2,         ~order,
+  "ASD",  "mol_trp",     "mol_niacin",  1,
+  "NAC",  "mol_trp",     "mol_kyn",     2,
+  "ASD",  "mol_trp",     "mol_gaba",    3,
+  "ASD",  "mol_trp",     "mol_ne",      4,
+  "ASD",  "mol_trp",     "mol_aea",     5,
+  "NAC",  "mol_trp",     "mol_aea",     6,
+  "ASD",  "mol_ne",      "mol_aea",     7,
+  "ASD",  "mol_niacin",  "mol_gaba",    8,
+  "ASD",  "mol_3nt",     "mol_ua",      9,
+  "ASD",  "mol_lca",     "mol_dca",     10,
+  "NAC",  "mol_lca",     "mol_dca",     11
+)
+
+sig_corr_stats = cor_df_labeled %>%
+  filter(Significant == TRUE) %>%
+  inner_join(panel_order, by = c("Group", "Var1", "Var2")) %>%
+  arrange(order) %>%
+  mutate(
+    q_label = case_when(
+      p_adj < 0.001 ~ "q < 0.001",
+      TRUE ~ str_c("q = ", sprintf("%.3f", p_adj))
+    ),
+    stat_label = str_c(
+      "Spearman r = ", sprintf("%.2f", r),
+      "\nFDR ", q_label
+    ),
+    panel_title = str_c(Group, ": ", Var2_label, " vs ", Var1_label)
+  )
+
+plot_sig_corr_pair = function(group_label, var1, var2, var1_label, var2_label,
+                              stat_label, panel_title) {
+
+  plot_df = avg_data %>%
+    filter(group == group_label) %>%
+    transmute(
+      Group = group,
+      x = .data[[var2]],
+      y = .data[[var1]]
+    ) %>%
+    filter(x > 0, y > 0)
+
+  label_df = plot_df %>%
+    summarise(
+      x = 10^(min(log10(x), na.rm = TRUE) + 0.05 * diff(range(log10(x), na.rm = TRUE))),
+      y = 10^(max(log10(y), na.rm = TRUE) - 0.05 * diff(range(log10(y), na.rm = TRUE)))
+    ) %>%
+    mutate(label = stat_label)
+
+  ggplot(plot_df, aes(x = x, y = y)) +
+    geom_point(
+      aes(fill = Group),
+      shape = 21,
+      color = "black",
+      stroke = 0.2,
+      size = 1.8,
+      alpha = 0.8
+    ) +
+    geom_smooth(
+      method = "loess",
+      se = FALSE,
+      linewidth = 0.5,
+      color = "black") +
+    geom_text(
+      data = label_df,
+      aes(x = x, y = y, label = label),
+      inherit.aes = FALSE,
+      hjust = 0,
+      vjust = 1,
+      size = 2.5,
+      lineheight = 0.95
+    ) +
+    scale_x_log10() +
+    scale_y_log10() +
+    scale_fill_manual(values = c("NAC" = "#21918c", "ASD" = "#fde725")) +
+    labs(
+      title = panel_title,
+      x = str_c(var2_label, " (nM, log10)"),
+      y = str_c(var1_label, " (nM, log10)"),
+      fill = "Group"
+    ) +
+    theme(
+      plot.title = element_text(size = 8),
+      axis.title = element_text(size = 7),
+      axis.text = element_text(size = 6),
+      aspect.ratio = 1
+    )
+}
+
+sig_corr_plots = pmap(
+  sig_corr_stats %>%
+    select(
+      group_label = Group,
+      var1 = Var1,
+      var2 = Var2,
+      var1_label = Var1_label,
+      var2_label = Var2_label,
+      stat_label,
+      panel_title
+    ),
+  plot_sig_corr_pair
+)
+
+wrap_plots(sig_corr_plots, ncol = 3, guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 9)
+  )
 ```
 
 ```{r univar_tests}
